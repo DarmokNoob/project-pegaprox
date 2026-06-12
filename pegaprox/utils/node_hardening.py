@@ -85,16 +85,22 @@ def _step_ssh_key(manager, node):
         return 'skip', 'SSH key already configured', None
 
     try:
-        import paramiko
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, NoEncryption, PrivateFormat, PublicFormat,
+        )
     except ImportError:
-        return 'warn', 'paramiko not available — SSH key setup skipped', None
+        return 'warn', 'cryptography library not available — SSH key setup skipped', None
 
     try:
-        key = paramiko.Ed25519Key.generate()
-        buf = io.StringIO()
-        key.write_private_key(buf)
-        private_pem = buf.getvalue()
-        pub_line = f"ssh-ed25519 {key.get_base64()} pegaprox-managed"
+        priv = Ed25519PrivateKey.generate()
+        private_pem = priv.private_bytes(
+            Encoding.PEM, PrivateFormat.OpenSSH, NoEncryption()
+        ).decode()
+        pub_line = (
+            priv.public_key().public_bytes(Encoding.OpenSSH, PublicFormat.OpenSSH).decode().strip()
+            + " pegaprox-managed"
+        )
 
         # Idempotent: append only if the exact line isn't already present.
         # Single-quoted heredoc prevents shell expansion of the key material.
