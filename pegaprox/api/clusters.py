@@ -216,6 +216,32 @@ def add_cluster():
     return jsonify(result), 201
 
 
+@bp.route('/api/clusters/<cluster_id>/hardening/pair', methods=['POST'])
+@require_auth(perms=['cluster.admin'])
+def run_pairing_hardening(cluster_id):
+    """Re-run pairing-time node hardening against all nodes in a cluster.
+
+    Safe to run on already-hardened clusters — every step is idempotent.
+    Useful after adding nodes, rebuilding a node, or upgrading PegaProx on
+    clusters that were paired before this feature shipped.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster offline'}), 503
+
+    hardening = deploy_pairing_hardening(mgr)
+    if hardening.get('ssh_key'):
+        save_config()
+    log_audit(
+        request.session['user'], 'cluster.hardening_applied',
+        f"On-demand hardening for cluster {cluster_id}: "
+        f"success={hardening['success']}, nodes={list(hardening['nodes'].keys())}",
+    )
+    return jsonify(hardening)
+
+
 @bp.route('/api/clusters/<cluster_id>/config/export', methods=['GET'])
 @require_auth(perms=['cluster.config'])
 def export_cluster_config(cluster_id):
