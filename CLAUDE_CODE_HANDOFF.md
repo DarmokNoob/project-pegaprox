@@ -1,16 +1,16 @@
-# PegaProx — Path C Development Handoff
-## For Claude Code running via VSCode Remote SSH on Overwatch
+# PegaProx - Path C Development Handoff
+## For Claude Code running locally (Windows) - testing via Overwatch deploy cycle
 
 ---
 
 ## Read This First
 
-This document is the complete working context for implementing **Path C** — a
+This document is the complete working context for implementing **Path C** - a
 pairing-time security hardening feature for PegaProx. Read every section before
 touching any code. The constraints in this document exist for specific reasons
 documented below.
 
-### STOP — Do These Before Writing Any Code
+### STOP - Do These Before Writing Any Code
 
 #### 1. Audit the existing CIS Hardening feature
 
@@ -28,34 +28,37 @@ of what Path C proposes. Before writing anything new:
 duplicate it.**
 
 Note: Issue #175 (v0.9.2) showed the Harden PVE Node feature failing with
-SSH errors. Verify whether this is resolved in v0.9.12.3-beta and understand
-the fix before building on top of it.
+SSH errors. Verify whether this is resolved in the current codebase (now at
+v0.9.13) and understand the fix before building on top of it.
 
 #### 2. Review all branches before assuming main is the right base
 
 The fork includes all upstream branches as of the fork date. Inspect them:
 
 ```bash
-cd /mnt/usb/pegaprox-dev/repo
 git branch -a | grep -v HEAD | sort
 ```
 
 Pay specific attention to branches containing: `security`, `hardening`,
 `harden`, `cis`, `node`, `pairing`, `aikido`. The upstream team had active
 security hardening work in v0.9.12 via the Aikido batch. There may be a
-relevant in-progress branch that `Secure-LXC` should be based on instead
-of `main`.
+relevant in-progress branch with code worth reviewing before implementing
+Path C fresh.
 
-#### 3. Verify Secure-LXC is current
+#### 3. Branch currency - ALREADY DONE
 
-Upstream is at **v0.9.12.3-beta**. Verify the branch is not behind:
+`Secure-LXC` has already been merged with upstream `main` (which is at
+v0.9.13). Merge commit `e97c5c4` is on top of the v0.9.13 release. Confirm
+this matches what you see locally:
 
 ```bash
 git log --oneline -5
-git log --oneline origin/main -5
 ```
 
-Rebase onto current `main` before starting work if it has moved ahead.
+Expected top commit: `e97c5c4 Merge remote-tracking branch 'origin/main' into Secure-LXC`
+
+If your local clone doesn't show this, run `git fetch origin && git pull
+origin Secure-LXC` before proceeding.
 
 ---
 
@@ -63,75 +66,103 @@ Rebase onto current `main` before starting work if it has moved ahead.
 
 | Item | Value |
 |---|---|
-| Host | Overwatch — `192.168.113.30` |
-| Hardware | Raspberry Pi 4 4GB |
-| OS | PiKVM OS (Arch Linux ARM) |
-| USB Drive | `/mnt/usb` — 64GB SSD, plenty of space |
-| Filesystem note | Root filesystem is read-only by default. Run `rw` before making changes to the OS, `ro` when done. The USB drive at `/mnt/usb` is always writable. |
+| Local dev machine | Windows 10, Ryzen x86/64, VSCode + Claude Code |
+| Repo location (local) | Wherever you cloned `git@github.com:DarmokNoob/project-pegaprox.git` |
+| Working branch | `Secure-LXC` |
+| Deployment target | Overwatch - Raspberry Pi 4 4GB, PiKVM OS, `192.168.113.30` |
+| Proxmox nodes | Watchguard `192.168.113.10` (primary), Guardwatch `192.168.113.110` (secondary) |
 
-### Production Container
+### Split Workflow - Read This Before Doing Anything
 
-```bash
-# Inspect before touching anything
-docker inspect pegaprox
-```
+**Code analysis and writing happens here, locally.** This is where the
+actual development work happens - reviewing files, implementing
+`node_hardening.py`, editing `vms.py`, etc.
 
-The production container is named `pegaprox` and must not be modified or
-interrupted during development. Get its exact ports, volumes, and environment
-from `docker inspect` before building the dev container.
+**You have SSH access to the deployment targets** via `~/.ssh/config` short
+names: `overwatch`, `watchguard`, `guardwatch` - all root, key-based, no
+password prompts. This closes the feedback loop without round-tripping
+through Colin for every iteration:
 
-### Dev Container
+1. Implement / edit code locally
+2. Commit and push to `Secure-LXC`
+3. `ssh overwatch '~/pegaprox-dev-deploy.sh'` - pulls latest and restarts
+   the dev container (no rebuild needed, `/app/pegaprox` is volume-mounted
+   to the live repo checkout on Overwatch)
+4. `ssh overwatch 'docker logs --tail 50 pegaprox-dev'` - check it started
+   cleanly
+5. Trigger whatever you're testing (replication job, node pairing, etc.)
+   via the dev container's API if needed, or run validation checks directly:
+   ```bash
+   ssh guardwatch "command -v sudo && echo sudo OK"
+   ssh guardwatch "visudo -c -f /etc/sudoers.d/pegaprox && echo sudoers OK"
+   ssh guardwatch "stat -c '%a' /etc/sudoers.d/pegaprox"
+   ssh guardwatch "systemctl is-active auditd && echo auditd OK"
+   ssh guardwatch "test -f /etc/audit/rules.d/pegaprox.rules && echo rules OK"
+   ssh guardwatch "ausearch -k pegaprox_lxc 2>/dev/null | tail -20"
+   ```
+6. Iterate based on results - edit, push, redeploy, retest
 
-```bash
-# Control scripts — generated by pegaprox_dev_setup.sh
-/mnt/usb/pegaprox-dev/dev-start.sh    # stop prod, start dev
-/mnt/usb/pegaprox-dev/dev-stop.sh     # stop dev, restore prod
-/mnt/usb/pegaprox-dev/dev-rebuild.sh  # rebuild image + restart dev
-/mnt/usb/pegaprox-dev/dev-logs.sh     # tail dev container logs
-/mnt/usb/pegaprox-dev/dev-shell.sh    # exec into dev container
-```
+If the dev container isn't running or needs to be recreated from scratch
+(e.g. after an image update), `ssh overwatch '~/pegaprox-dev-run.sh'` -
+occasional/setup only, normal iteration uses `pegaprox-dev-deploy.sh`.
 
-If the dev setup script has not been run yet:
+### Guardrails on SSH Usage
 
-```bash
-# Clone the fork (uses homelab_github SSH key already configured on Overwatch)
-cd /mnt/usb
-git clone git@github.com:DarmokNoob/project-pegaprox.git pegaprox-dev/repo
-cd pegaprox-dev/repo
-git checkout Secure-LXC
-```
+**SSH is for execution and observation, not development.**
 
-Dev container name: `pegaprox-dev`
-Dev image tag: `pegaprox-dev:latest`
-Dev repo path: `/mnt/usb/pegaprox-dev/repo`
-Working branch: `Secure-LXC`
+- DO run deploy scripts, restart containers, tail logs, run validation
+  commands, query `pct`/`qm`/`systemctl`/`auditd` state on the targets
+- DO NOT edit files directly on Overwatch/Watchguard/Guardwatch over SSH -
+  all code changes happen in the local repo, committed and pushed, then
+  pulled via the deploy script
+- DO NOT start any persistent session, language server, file watcher, or
+  IDE-like process on any remote host - this is exactly the pattern that
+  overloaded the Pi previously. One-shot commands only.
+- DO NOT modify the production `pegaprox` container (ports 5000-5002) -
+  only `pegaprox-dev` (ports 5010-5012) and its isolated data directory
+  are in scope
+- If something needs fixing on a remote host itself (not in the repo) -
+  e.g. a permissions issue in `/mnt/usb/pegaprox-dev/data` - a single SSH
+  command to fix it is fine. Standing up new infrastructure or multi-step
+  remote configuration is not - flag it for Colin instead.
 
-### GitHub SSH
+### Deployment Target Reference
 
-The `homelab_github` SSH key is already configured on Overwatch at
-`~/.ssh/homelab_github` with a `Host github.com` block in `~/.ssh/config`.
-No additional SSH setup needed for git operations.
+| Item | Value |
+|---|---|
+| Overwatch | `192.168.113.30` / `overwatch.thematrix.lan` (SSH alias: `overwatch`) |
+| Dev container name | `pegaprox-dev` |
+| Dev container image | `ghcr.io/pegaprox/pegaprox:latest` |
+| Dev data dir (isolated) | `/mnt/usb/pegaprox-dev/data` |
+| Repo on Overwatch | `/mnt/usb/root-home/repos/project-pegaprox` (alias `~/repos/project-pegaprox`) |
+| Dev web UI | `https://overwatch.thematrix.lan:5010` |
+| Primary Proxmox node | Watchguard - `192.168.113.10` / `watchguard.thematrix.lan` (SSH alias: `watchguard`) |
+| Secondary Proxmox node | Guardwatch - `192.168.113.110` / `guardwatch.thematrix.lan` (SSH alias: `guardwatch`) |
+
+**Your job is not done until the code is pushed AND verified working** via
+the SSH-based checks above. If validation fails, iterate - edit, push,
+redeploy, retest - before reporting completion.
 
 ---
 
 ## What PegaProx Is
 
 PegaProx is a Proxmox cluster management and LXC/VM replication tool. It runs
-as a Docker container on Overwatch and manages multiple Proxmox nodes
-(Watchguard at `192.168.113.10` and Guardwatch at `192.168.113.110`).
+as a Docker container and manages multiple Proxmox nodes (Watchguard and
+Guardwatch above).
 
 It communicates with Proxmox nodes via two channels:
-1. **Proxmox REST API** — standard cluster management operations
-2. **SSH via paramiko** — operations Proxmox does not expose through its API
+1. **Proxmox REST API** - standard cluster management operations
+2. **SSH via paramiko** - operations Proxmox does not expose through its API
 
 The SSH connection pool lives in `pegaprox/utils/ssh_pool.py`. PegaProx uses
 paramiko to execute varied commands over persistent SSH connections. This is
-not a single fixed command — it sends many different operations depending on
+not a single fixed command - it sends many different operations depending on
 the feature being used.
 
 ---
 
-## The Security Finding — Read Carefully
+## The Security Finding - Read Carefully
 
 ### The Silent Privilege Escalation
 
@@ -144,9 +175,26 @@ contains an if/else auth flow:
 3. Fall back to username/password ticket authentication
 4. Every subsequent `_api_put()` call automatically rides the ticket
 
-**The ticket authenticates as root@pam.** This is not logged. The operator
-has no visibility that this escalation has occurred unless they inspect the
-network session directly.
+**The ticket authenticates as root@pam.** This is not logged at a level that
+makes the escalation obvious. The operator has limited visibility that this
+escalation has occurred unless they inspect the network session or read INFO
+logs carefully.
+
+### Live Evidence (Captured from the Dev Container)
+
+This exact behavior was observed live against Watchguard when the dev
+container started up:
+
+```
+[PegaProx_Primary Network Stack] WARNING: API Token auth failed at watchguard.thematrix.lan: 401
+[PegaProx_Primary Network Stack] INFO: Stored API token rejected, trying password auth
+[PegaProx_Primary Network Stack] INFO: Successfully connected to Proxmox at watchguard.thematrix.lan
+```
+
+This confirms the fallback is real, occurs on a live node, and the only
+visibility into it is these three log lines at WARNING/INFO level - no
+distinct audit event, no flag, nothing that would surface in a dashboard or
+alert. Use this as a concrete reference when reviewing `_create_session()`.
 
 ### Why root@pam Is Required
 
@@ -156,8 +204,8 @@ Proxmox hardcodes an identity check in `LXC.pm`:
 return 1 if $authuser eq 'root@pam';
 ```
 
-This is an identity check, not a permission check. No API token — regardless
-of granted permissions — can pass it. It gates:
+This is an identity check, not a permission check. No API token - regardless
+of granted permissions - can pass it. It gates:
 - Setting LXC feature flags (`mknod`, `fuse`, `keyctl`, `nfs`, `cifs`)
 - Certain other LXC configuration operations
 
@@ -166,10 +214,10 @@ of granted permissions — can pass it. It gates:
 PegaProx's own documentation explicitly states these features require full
 root SSH access and will not work with limited credentials:
 
-- **Rolling Updates** — runs `apt`, `systemctl` across nodes
-- **SMBIOS Auto-Config** — writes hardware-level configuration
-- **2-Node HA** — fencing and heartbeat operations
-- **Node Shell** — it is a root shell by design
+- **Rolling Updates** - runs `apt`, `systemctl` across nodes
+- **SMBIOS Auto-Config** - writes hardware-level configuration
+- **2-Node HA** - fencing and heartbeat operations
+- **Node Shell** - it is a root shell by design
 
 **DO NOT attempt to restrict these operations.** They are intentional design
 requirements driven by what Proxmox does not expose via API. Any sudoers
@@ -189,10 +237,10 @@ additionally:
 
 1. **Installs sudo** via `apt install sudo` if not present (Debian managed
    package, not affected by Proxmox updates)
-2. **Deploys `/etc/sudoers.d/pegaprox`** — a scoped sudoers policy
+2. **Deploys `/etc/sudoers.d/pegaprox`** - a scoped sudoers policy
    specifically for LXC replication operations
 3. **Installs auditd** if not present
-4. **Deploys `/etc/audit/rules.d/pegaprox.rules`** — audit rules that log
+4. **Deploys `/etc/audit/rules.d/pegaprox.rules`** - audit rules that log
    every invocation of the scoped commands and watch the sudoers file for
    modifications
 
@@ -219,19 +267,19 @@ Audit log target: `/var/log/pegaprox-sudo.log`
 
 - Does not restrict PegaProx's SSH root access for Rolling Updates, SMBIOS,
   HA, or Node Shell
-- Does not deploy AppArmor profiles (deferred — paramiko's multi-command SSH
+- Does not deploy AppArmor profiles (deferred - paramiko's multi-command SSH
   pattern makes host-side AppArmor impractical without breaking PegaProx
   features)
 - Does not conflict with Nico Schmidt's (MrMasterbay) proxmox-security-hardening
-  script — our files live in separate paths and are additive
+  script - our files live in separate paths and are additive
 - Does not conflict with community-scripts.org scripts
 
 ### The Audit Trail
 
-sudo logs every invocation to syslog natively. Overwatch/PegaProx already
-forwards syslog to the central syslog-ng collector on pfSense Secondary
-(`192.168.113.3:514`). The audit trail flows automatically into the existing
-log pipeline with no additional instrumentation.
+sudo logs every invocation to syslog natively. The homelab forwards syslog to
+a central syslog-ng collector on pfSense Secondary (`192.168.113.3:514`). The
+audit trail flows automatically into the existing log pipeline with no
+additional instrumentation.
 
 ---
 
@@ -241,9 +289,10 @@ Review these files in order before writing any new code. Understand the
 existing patterns before adding to them.
 
 ### 1. `pegaprox/core/manager.py`
-- `_create_session()` — the auth fallback that produces the silent escalation
-- `_api_put()` — how subsequent API calls use the escalated session
-- `_ssh_connect()` — how SSH sessions are established to nodes
+- `_create_session()` - the auth fallback that produces the silent escalation
+  (see live evidence above)
+- `_api_put()` - how subsequent API calls use the escalated session
+- `_ssh_connect()` - how SSH sessions are established to nodes
 - Understand the Manager class lifecycle before adding anything to it
 
 ### 2. `pegaprox/utils/ssh_pool.py`
@@ -257,14 +306,14 @@ existing patterns before adding to them.
 - The pattern for returning success/failure from node operations
 
 ### 4. `pegaprox/background/cross_cluster_replication.py`
-- The LXC replication pipeline — this is the surface the sudoers policy covers
-- Patches already applied: duplicate job prevention, hostname restore,
-  MAC restore, feature flag restore
+- The LXC replication pipeline - this is the surface the sudoers policy covers
+- Patches already applied (verify present after the v0.9.13 merge): duplicate
+  job prevention, hostname restore, MAC restore, feature flag restore
 
 ### 5. Any existing hardening-related code
 - Check if a `harden` module, endpoint, or utility already exists
 - The "Harden PVE Node" feature in PegaProx scans for compliance but does
-  not deploy controls — Path C is the deployment counterpart
+  not deploy controls - Path C is the deployment counterpart
 
 ---
 
@@ -278,10 +327,10 @@ Create `pegaprox/utils/node_hardening.py`:
 - Uses the existing SSH connection pool to execute hardening commands
 - Returns a structured result: `{success: bool, steps: [{name, status, detail}]}`
 - Each step (sudo install, sudoers deploy, auditd install, audit rules deploy)
-  is independent — failure of one step should not abort others, but all
+  is independent - failure of one step should not abort others, but all
   results must be reported
 - Validates each step after execution (visudo -c on the sudoers file, etc.)
-- Idempotent — safe to run multiple times on the same node
+- Idempotent - safe to run multiple times on the same node
 
 ### Integration Point
 
@@ -289,12 +338,12 @@ Hook into the existing node pairing flow in `vms.py`. After the node is
 successfully added and validated, call `deploy_pairing_hardening()`. The
 result should be:
 - Logged regardless of outcome
-- Surfaced to the UI as a pairing step result (not a pairing blocker — a
+- Surfaced to the UI as a pairing step result (not a pairing blocker - a
   hardening failure should warn, not prevent the node from being added)
 
 ### The Sudoers File Content
 
-Deploy this exactly — validate with `visudo -c -f` before leaving it in place,
+Deploy this exactly - validate with `visudo -c -f` before leaving it in place,
 remove it if validation fails:
 
 ```
@@ -327,7 +376,7 @@ Permissions: `chmod 440 /etc/sudoers.d/pegaprox`
 Deploy to `/etc/audit/rules.d/pegaprox.rules`:
 
 ```
-# PegaProx Audit Rules — generated by PegaProx pairing process
+# PegaProx Audit Rules - generated by PegaProx pairing process
 
 # Watch sudoers file for modifications
 -w /etc/sudoers.d/pegaprox -p wa -k pegaprox_sudoers
@@ -348,53 +397,18 @@ augenrules --load 2>/dev/null || systemctl restart auditd
 
 ---
 
-## Building the Dev Container
+## Testing - Run These Yourself via SSH
 
-```bash
-# From Overwatch terminal or VSCode integrated terminal
-cd /mnt/usb/pegaprox-dev/repo
-git checkout Secure-LXC
-git pull origin Secure-LXC
-
-# Build (native ARM64 — first build takes a few minutes)
-docker build -t pegaprox-dev:latest .
-
-# Inspect production container for exact run flags
-docker inspect pegaprox
-
-# Stop production, start dev (mirror prod run command but with dev image)
-docker stop pegaprox
-docker run -d \
-    --name pegaprox-dev \
-    --restart no \
-    [same ports as production] \
-    [same volumes as production] \
-    [same env vars as production] \
-    pegaprox-dev:latest
-
-# Watch logs
-docker logs -f pegaprox-dev
-```
-
-After each code change:
-```bash
-docker stop pegaprox-dev && docker rm pegaprox-dev
-docker build -t pegaprox-dev:latest /mnt/usb/pegaprox-dev/repo
-docker run -d --name pegaprox-dev --restart no [flags] pegaprox-dev:latest
-docker logs -f pegaprox-dev
-```
-
----
-
-## Testing
+These are the checks defined earlier in the Split Workflow section. Run them
+after each deploy cycle to confirm "done" actually means done.
 
 ### Unit-Level
 
-Test `deploy_pairing_hardening()` against Guardwatch (`192.168.113.110`)
-first — it is the secondary node and the lower-risk test target.
+`deploy_pairing_hardening()` will be tested against Guardwatch
+(`192.168.113.110`) first - it is the secondary node and the lower-risk test
+target.
 
 ```bash
-# After hardening runs against Guardwatch, verify:
 ssh root@192.168.113.110 "command -v sudo && echo sudo OK"
 ssh root@192.168.113.110 "visudo -c -f /etc/sudoers.d/pegaprox && echo sudoers OK"
 ssh root@192.168.113.110 "stat -c '%a' /etc/sudoers.d/pegaprox"  # expect 440
@@ -404,17 +418,16 @@ ssh root@192.168.113.110 "test -f /etc/audit/rules.d/pegaprox.rules && echo rule
 
 ### Integration
 
-Trigger a cross-cluster LXC replication job from the dev container UI and
-verify:
-1. Replication completes successfully
-2. `/var/log/pegaprox-sudo.log` on the target node shows entries
-3. `ausearch -k pegaprox_lxc` on the target node returns audit records
-4. Hostname, MAC, and feature flags are preserved (existing patches)
+Triggering a cross-cluster LXC replication job from the dev container UI
+should result in:
+1. Replication completing successfully
+2. `/var/log/pegaprox-sudo.log` on the target node showing entries
+3. `ausearch -k pegaprox_lxc` on the target node returning audit records
+4. Hostname, MAC, and feature flags preserved (existing patches)
 
 ### Non-Regression
 
-After hardening is deployed on Guardwatch, verify these still work from
-the dev container:
+After hardening is deployed on Guardwatch, these must still work:
 - Rolling Updates (if safe to run)
 - Node Shell access
 - General cluster health checks
@@ -423,7 +436,7 @@ These use root SSH directly and must be unaffected by the sudoers policy.
 
 ### Idempotency
 
-Run the pairing hardening twice against the same node. The second run must:
+Running the pairing hardening twice against the same node must:
 - Not create duplicate sudoers entries
 - Not duplicate auditd rules
 - Report that each step was already in place
@@ -449,29 +462,39 @@ Push to: `github.com/DarmokNoob/project-pegaprox`
 
 ### Existing Patches in the Codebase (Already Merged to v0.9.12)
 
-These are already shipped upstream — do not re-implement them:
-- **#455** — duplicate LXC replication job prevention (`_running_jobs` set)
-- **#456** — hostname and MAC restoration after cross-cluster migration
-- **Feature flag restore** — `mknod`, `fuse`, `keyctl` restoration post-migration
+These are already shipped upstream - do not re-implement them:
+- **#455** - duplicate LXC replication job prevention (`_running_jobs` set)
+- **#456** - hostname and MAC restoration after cross-cluster migration
+- **Feature flag restore** - `mknod`, `fuse`, `keyctl` restoration post-migration
 
-Verify these patches are present in the `Secure-LXC` branch before assuming
-they need to be re-applied. If missing, they need to be cherry-picked from
-upstream v0.9.12.
+Verify these patches are present in `Secure-LXC` (they should be, given the
+v0.9.13 merge brings in everything from v0.9.12 and later).
 
 ### Upstream Issues
 
-- **#457** is open — this is the feature request Path C addresses
+- **#457** is open - this is the feature request Path C addresses
 - Marcus Kellermann (mkellermann97) is holding Path A pending this work
-- Nico Schmidt (MrMasterbay) is the architecture owner — this will eventually
+- Nico Schmidt (MrMasterbay) is the architecture owner - this will eventually
   need his review
 
-### Related Script
+### Reference Script: pegaprox_pair.sh
 
-`pegaprox_pair.sh` is a standalone bash script that does the same hardening
-operations as a manual pre-pairing tool. It lives outside the PegaProx repo
-and is already written and syntax-validated. Use it as a reference for the
-exact command sequence and validation logic — the Python implementation in
-`node_hardening.py` should mirror its logic.
+A standalone bash script exists that performs the same hardening operations
+as a manual pre-pairing tool (SSH connectivity check, key deployment, sudo
+install, sudoers deploy with visudo validation, auditd install and rules).
+It has not been tested against a live node. Use it as a reference for the
+exact command sequence and validation logic if useful - but apply the
+decision gate below first.
+
+**Decision gate:** Audit how the existing CIS Hardening and CVE Scanner
+features execute commands against nodes. If they use paramiko
+`exec_command()` calls in Python, implement Path C the same way for
+consistency. If PegaProx already shells out to bash scripts for any node
+operations, calling a script from Python is acceptable. Do not mix
+approaches - pick one and be consistent with the existing codebase pattern.
+
+If you need the full script contents, ask - it can be provided separately
+rather than bloating this document.
 
 ---
 
@@ -490,212 +513,22 @@ A new Proxmox node paired through the PegaProx UI results in:
 
 ---
 
-
----
-
-## Reference: pegaprox_pair.sh
-
-This script was written as a standalone prerequisite validator and hardening
-tool for manually preparing a Proxmox node before pairing it with PegaProx.
-It has not yet been tested against a live node. It is included here as a
-reference for the exact command sequence, validation logic, and idempotency
-patterns that the Python implementation should mirror.
-
-### Decision Gate for Claude Code
-
-**Before deciding whether to use this script or implement in pure Python:**
-
-1. Audit how the existing CIS Hardening and CVE Scanner features execute
-   commands against nodes — if they use paramiko `exec_command()` calls
-   in Python, implement Path C the same way for consistency
-2. If PegaProx already shells out to bash scripts for any node operations,
-   using this script called from Python is acceptable
-3. Do not mix approaches — pick one and be consistent with the existing
-   codebase pattern
-
-The script covers these phases in order:
-- Phase 1: SSH connectivity check + Proxmox node validation (`pveum`)
-- Phase 2: SSH key deployment if not already configured
-- Phase 3: Password auth status check (disable flag off by default)
-- Phase 4: sudo installation via apt if not present
-- Phase 5: `/etc/sudoers.d/pegaprox` deployment with `visudo -c` validation
-- Phase 6: auditd installation + `/etc/audit/rules.d/pegaprox.rules` deployment
-- Phase 7: Eight-point validation summary with pass/fail counts
-
-### Script Contents
-
-```bash
-#!/bin/bash
-# =============================================================================
-# PegaProx Node Pairing — Prerequisite Validation & Hardening
-# =============================================================================
-#
-# Run this against a target Proxmox node before pairing it with PegaProx.
-# Validates SSH connectivity, sets up key-based auth, installs sudo, and
-# deploys a scoped sudoers policy for PegaProx operations.
-#
-# Usage:
-#   ./pegaprox_pair.sh -h <host> -u <user> [-p <port>] [-k <pubkey_path>]
-#                      [--disable-password-auth]
-#
-# Flags:
-#   -h  Target Proxmox node hostname or IP        (required)
-#   -u  SSH user                                  (required, typically root)
-#   -p  SSH port                                  (default: 22)
-#   -k  Path to public key to deploy              (default: ~/.ssh/id_rsa.pub)
-#   --disable-password-auth                       (default: OFF — set explicitly to enable)
-#
-# =============================================================================
-
-set -euo pipefail
-
-SSH_PORT=22
-SSH_USER=""
-SSH_HOST=""
-PUBKEY_PATH="${HOME}/.ssh/id_rsa.pub"
-DISABLE_PASSWORD_AUTH=false
-PEGAPROX_SUDOERS_FILE="/etc/sudoers.d/pegaprox"
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-log_ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
-log_section() {
-    echo ""
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}  $*${NC}"
-    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-}
-die() { log_error "$*"; exit 1; }
-
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h) SSH_HOST="$2";  shift 2 ;;
-        -u) SSH_USER="$2";  shift 2 ;;
-        -p) SSH_PORT="$2";  shift 2 ;;
-        -k) PUBKEY_PATH="$2"; shift 2 ;;
-        --disable-password-auth) DISABLE_PASSWORD_AUTH=true; shift ;;
-        *) die "Unknown argument: $1" ;;
-    esac
-done
-
-[[ -z "$SSH_HOST" ]] && die "Target host required (-h)"
-[[ -z "$SSH_USER" ]] && die "SSH user required (-u)"
-
-remote() {
-    ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-        -o ConnectTimeout=10 "${SSH_USER}@${SSH_HOST}" "$@"
-}
-
-# PHASE 1 — Connectivity + Proxmox validation
-if ! ssh -p "$SSH_PORT" -o BatchMode=true -o ConnectTimeout=10 \
-         -o StrictHostKeyChecking=accept-new \
-         "${SSH_USER}@${SSH_HOST}" "exit 0" 2>/dev/null; then
-    log_warn "Key auth failed — trying password..."
-    ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-        -o ConnectTimeout=10 -o PreferredAuthentications=password \
-        "${SSH_USER}@${SSH_HOST}" "exit 0" || \
-        die "Cannot connect to ${SSH_HOST}"
-    KEY_AUTH_CONFIGURED=false
-else
-    KEY_AUTH_CONFIGURED=true
-fi
-remote "command -v pveum >/dev/null 2>&1" || die "Not a Proxmox node"
-
-# PHASE 2 — SSH key deployment
-if [[ "$KEY_AUTH_CONFIGURED" == false ]]; then
-    PUBKEY_CONTENT=$(cat "$PUBKEY_PATH")
-    ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-        -o PreferredAuthentications=password "${SSH_USER}@${SSH_HOST}" \
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-         touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && \
-         grep -qxF '${PUBKEY_CONTENT}' ~/.ssh/authorized_keys || \
-         echo '${PUBKEY_CONTENT}' >> ~/.ssh/authorized_keys"
-fi
-
-# PHASE 3 — Password auth (disabled flag off by default)
-if [[ "$DISABLE_PASSWORD_AUTH" == true ]]; then
-    remote "sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' \
-            /etc/ssh/sshd_config && systemctl restart sshd"
-fi
-
-# PHASE 4 — sudo installation
-remote "command -v sudo >/dev/null 2>&1" || \
-    remote "apt-get update -qq && apt-get install -y sudo"
-
-# PHASE 5 — PegaProx sudoers policy
-if ! remote "test -f ${PEGAPROX_SUDOERS_FILE} 2>/dev/null"; then
-    remote "cat > ${PEGAPROX_SUDOERS_FILE} << 'SUDOERS_EOF'
-# PegaProx Scoped Sudoers Policy — LXC replication surface only
-# Rolling Updates / SMBIOS / HA / Node Shell use root SSH directly
-
-Defaults:root    logfile=/var/log/pegaprox-sudo.log
-Defaults:root    log_year
-Defaults:root    log_host
-
-root ALL=(ALL) NOPASSWD: /usr/bin/vzdump *
-root ALL=(ALL) NOPASSWD: /usr/sbin/pct start *
-root ALL=(ALL) NOPASSWD: /usr/sbin/pct stop *
-root ALL=(ALL) NOPASSWD: /usr/sbin/pct status *
-root ALL=(ALL) NOPASSWD: /usr/sbin/pct config *
-root ALL=(ALL) NOPASSWD: /usr/sbin/qm start *
-root ALL=(ALL) NOPASSWD: /usr/sbin/qm stop *
-root ALL=(ALL) NOPASSWD: /usr/sbin/qm status *
-root ALL=(ALL) NOPASSWD: /usr/sbin/qm config *
-SUDOERS_EOF"
-    remote "visudo -c -f ${PEGAPROX_SUDOERS_FILE}" || \
-        { remote "rm -f ${PEGAPROX_SUDOERS_FILE}"; die "Sudoers validation failed"; }
-    remote "chmod 440 ${PEGAPROX_SUDOERS_FILE}"
-fi
-
-# PHASE 6 — auditd + rules
-remote "command -v auditctl >/dev/null 2>&1" || \
-    remote "apt-get install -y auditd"
-
-AUDIT_RULES_FILE="/etc/audit/rules.d/pegaprox.rules"
-if ! remote "test -f ${AUDIT_RULES_FILE} 2>/dev/null"; then
-    remote "cat > ${AUDIT_RULES_FILE} << 'AUDIT_EOF'
--w /etc/sudoers.d/pegaprox -p wa -k pegaprox_sudoers
--w /var/log/pegaprox-sudo.log -p wa -k pegaprox_sudo_log
--a always,exit -F arch=b64 -F exe=/usr/bin/vzdump -k pegaprox_backup
--a always,exit -F arch=b64 -F exe=/usr/sbin/pct -k pegaprox_lxc
--a always,exit -F arch=b64 -F exe=/usr/sbin/qm -k pegaprox_vm
-AUDIT_EOF"
-    remote "augenrules --load 2>/dev/null || systemctl restart auditd"
-fi
-
-# PHASE 7 — Validation summary
-for check in \
-    "sudo installed:command -v sudo" \
-    "sudoers file exists:test -f ${PEGAPROX_SUDOERS_FILE}" \
-    "sudoers perms 440:stat -c '%a' ${PEGAPROX_SUDOERS_FILE} | grep -q 440" \
-    "sudoers valid:visudo -c -f ${PEGAPROX_SUDOERS_FILE}" \
-    "auditd running:systemctl is-active auditd" \
-    "audit rules present:test -f ${AUDIT_RULES_FILE}"; do
-    label="${check%%:*}"
-    cmd="${check#*:}"
-    remote "$cmd" >/dev/null 2>&1 \
-        && log_ok "$label" \
-        || log_error "FAIL: $label"
-done
-```
-
----
-
 ## Do Not
 
-- Do not modify `manager.py` auth logic — the silent escalation is a known
+- Do not modify `manager.py` auth logic - the silent escalation is a known
   issue being addressed separately via a future feature request after
   detection engineering review
-- Do not attempt to scope PegaProx's SSH operations broadly — Rolling Updates,
+- Do not attempt to scope PegaProx's SSH operations broadly - Rolling Updates,
   SMBIOS, HA, and Node Shell legitimately need full root SSH
-- Do not add AppArmor profiles to Proxmox nodes — the paramiko multi-command
+- Do not add AppArmor profiles to Proxmox nodes - the paramiko multi-command
   SSH pattern makes targeted confinement impractical without breaking PegaProx
-- Do not stop or modify the production `pegaprox` container during development
-- Do not push directly to `main` — all work stays on `Secure-LXC`
+- Do not modify or assume write access to the production `pegaprox`
+  container (ports 5000-5002) or its data directory
+  (`/mnt/usb/pegaprox/`) - only `pegaprox-dev` and
+  `/mnt/usb/pegaprox-dev/data` are in scope
+- Do not push directly to `main` - all work stays on `Secure-LXC`
+- Do not edit files on Overwatch/Watchguard/Guardwatch via SSH - see
+  Guardrails on SSH Usage above. SSH is for running deploy/validation
+  commands and reading output only.
+- Do not start any IDE session, language server, or file watcher on a
+  remote host - one-shot commands only
