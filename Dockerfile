@@ -8,6 +8,12 @@ LABEL org.label-schema.vcs-url="https://github.com/PegaProx/project-pegaprox"
 LABEL maintainer="support@pegaprox.com"
 
 # Install system dependencies
+# MK 2026-06-10 — `apt-get upgrade -y` pulls the latest Debian security patches
+# at build time (incl. the openssl ~deb13u2 fix for CVE-2026-45447/7383 et al
+# that Aikido flagged). For that to actually take effect the release build runs
+# with no cache (docker.yml: no-cache: true) — otherwise the GHA layer cache
+# kept this step frozen and the stale openssl got republished. Build is
+# tag-triggered so the full rebuild cost is fine.
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     gcc libffi-dev libssl-dev \
     openssh-client sshpass \

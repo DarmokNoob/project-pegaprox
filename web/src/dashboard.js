@@ -7466,10 +7466,137 @@
             );
         }
 
+        // NS 2026-06-05 — Cloud skin (Preview) overview. Resource-first card grid
+        // over the existing cluster→node→VM data (no tenant landing — tenant here
+        // is only a cluster-access filter, no VM ownership/quota to render).
+        // Presentational only: consumes state PegaProxDashboard already holds, no new API.
+        function CloudOverviewGrid({ clusters, selectedCluster, clusterMetrics, clusterResources, t }) {
+            const list = Array.isArray(clusters) ? clusters : [];
+            const res = Array.isArray(clusterResources) ? clusterResources : [];
+            const vms = res.filter(r => r && (r.type === 'qemu' || r.type === 'lxc'));
+            const runningVms = vms.filter(v => v.status === 'running');
+            const running = runningVms.length;
+            const clamp = (v) => Math.max(0, Math.min(100, Math.round(v || 0)));
+            const cpuOf = (r) => clamp((r.cpu || 0) * 100);
+            const memOf = (r) => r.maxmem ? clamp((r.mem / r.maxmem) * 100) : 0;
+            const meterColor = (p) => p > 90 ? 'var(--cloud-error)' : p > 75 ? 'var(--cloud-warning)' : 'var(--cloud-accent)';
+            // at-a-glance aggregates from the selected cluster's resources (defensive)
+            const nodes = new Set(vms.map(v => v.node).filter(Boolean)).size;
+            const vcpu = vms.reduce((s, v) => s + (v.maxcpu || 0), 0);
+            const ramAlloc = vms.reduce((s, v) => s + (v.maxmem || 0), 0);
+            const ramUsed = runningVms.reduce((s, v) => s + (v.mem || 0), 0);
+            const ramPct = ramAlloc ? clamp(ramUsed / ramAlloc * 100) : 0;
+            const cpuAvg = running ? clamp(runningVms.reduce((s, v) => s + (v.cpu || 0) * 100, 0) / running) : 0;
+            const connected = list.filter(c => c.connected).length;
+            const gbStr = (b) => ((b || 0) / 1073741824).toFixed(0);
+            const Stat = ({ icon, num, label }) => (
+                <div className="cloud-stat">
+                    <div className="cloud-stat-icon">{icon}</div>
+                    <div><div className="cloud-stat-num">{num}</div><div className="cloud-stat-label">{label}</div></div>
+                </div>
+            );
+            const Gauge = ({ pct, label }) => (
+                <div className="flex flex-col items-center gap-1">
+                    <div className="cloud-gauge" style={{ background: `conic-gradient(${meterColor(pct)} ${pct * 3.6}deg, var(--cloud-surface-1) 0)` }}>
+                        <div className="cloud-gauge-inner"><span style={{ fontSize: '18px', fontWeight: 700, color: 'var(--color-text)' }}>{pct}%</span></div>
+                    </div>
+                    <span style={{ fontSize: '11px', color: 'var(--cloud-text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+                </div>
+            );
+            return (
+                <div className="space-y-6" style={{ padding: 'var(--space-md, 14px)' }}>
+                    {/* at-a-glance summary tiles */}
+                    <div className="cloud-stat-grid">
+                        <Stat icon={<Icons.Database className="w-5 h-5" />} num={`${connected}/${list.length}`} label={t('clusters') || 'Clusters'} />
+                        <Stat icon={<Icons.Server className="w-5 h-5" />} num={nodes || '—'} label={t('nodes') || 'Nodes'} />
+                        <Stat icon={<Icons.Box className="w-5 h-5" />} num={vms.length} label={'VMs / CTs'} />
+                        <Stat icon={<Icons.PlayCircle className="w-5 h-5" />} num={running} label={t('running') || 'Running'} />
+                        <Stat icon={<Icons.Cpu className="w-5 h-5" />} num={vcpu || '—'} label={'vCPU'} />
+                        <Stat icon={<Icons.HardDrive className="w-5 h-5" />} num={ramAlloc ? gbStr(ramAlloc) + 'G' : '—'} label={'RAM'} />
+                    </div>
+                    {selectedCluster && (running > 0 || ramAlloc > 0) && (
+                        <div className="cloud-card" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2xl, 40px)', flexWrap: 'wrap' }}>
+                            <div className="flex items-center gap-2" style={{ color: 'var(--cloud-text-secondary)' }}>
+                                <Icons.Database className="w-4 h-4" style={{ color: 'var(--cloud-accent)' }} />
+                                <span className="text-sm font-semibold">{selectedCluster.display_name || selectedCluster.name}</span>
+                            </div>
+                            <Gauge pct={cpuAvg} label={'CPU'} />
+                            <Gauge pct={ramPct} label={'RAM'} />
+                        </div>
+                    )}
+                    <div>
+                        <div className="flex items-center gap-2 mb-3">
+                            <Icons.Cloud className="w-4 h-4" style={{ color: 'var(--cloud-accent)' }} />
+                            <span className="text-sm font-semibold" style={{ color: 'var(--cloud-text-secondary)' }}>{t('clusters') || 'Clusters'}</span>
+                            <span className="text-xs" style={{ color: 'var(--cloud-text-muted)' }}>({list.length})</span>
+                        </div>
+                        <div className="cloud-card-grid">
+                            {list.map(c => (
+                                <div key={c.id} className="cloud-card">
+                                    <div className="flex items-center justify-between mb-3">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                            <Icons.Database className="w-4 h-4 flex-shrink-0" style={{ color: 'var(--cloud-accent)' }} />
+                                            <span className="font-semibold truncate" style={{ color: 'var(--color-text)' }}>{c.display_name || c.name || c.id}</span>
+                                        </div>
+                                        <span className="text-[11px] px-2 py-0.5 rounded-full flex-shrink-0" style={c.connected
+                                            ? { background: 'rgba(45,212,167,0.15)', color: 'var(--cloud-success)' }
+                                            : { background: 'rgba(248,113,113,0.15)', color: 'var(--cloud-error)' }}>
+                                            {c.connected ? (t('online') || 'online') : (t('offline') || 'offline')}
+                                        </span>
+                                    </div>
+                                    {c.host && <div className="text-xs font-mono truncate" style={{ color: 'var(--cloud-text-muted)' }}>{c.host}</div>}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                    {selectedCluster && (
+                        <div>
+                            <div className="flex items-center gap-2 mb-3">
+                                <Icons.Server className="w-4 h-4" style={{ color: 'var(--cloud-accent)' }} />
+                                <span className="text-sm font-semibold" style={{ color: 'var(--cloud-text-secondary)' }}>{selectedCluster.display_name || selectedCluster.name} — {t('resources') || 'Resources'}</span>
+                                <span className="text-xs" style={{ color: 'var(--cloud-text-muted)' }}>{running}/{vms.length} {t('running') || 'running'}</span>
+                            </div>
+                            {vms.length === 0 ? (
+                                <div className="text-sm" style={{ color: 'var(--cloud-text-muted)' }}>{t('noResults') || 'No resources'}</div>
+                            ) : (
+                                <div className="cloud-card-grid">
+                                    {vms.slice(0, 60).map(v => {
+                                        const cp = cpuOf(v), mp = memOf(v);
+                                        return (
+                                            <div key={v.vmid} className="cloud-card">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <Icons.Box className="w-4 h-4 flex-shrink-0" style={{ color: v.type === 'qemu' ? 'var(--cloud-accent)' : 'var(--cloud-info)' }} />
+                                                        <span className="font-medium truncate" style={{ color: 'var(--color-text)' }}>{v.name || `${v.type === 'qemu' ? 'VM' : 'CT'} ${v.vmid}`}</span>
+                                                    </div>
+                                                    <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ background: v.status === 'running' ? 'var(--cloud-success)' : 'var(--cloud-text-muted)' }} />
+                                                </div>
+                                                <div className="text-[11px] mb-3" style={{ color: 'var(--cloud-text-muted)' }}>{v.type === 'qemu' ? 'VM' : 'CT'} {v.vmid} · {v.node || '—'}</div>
+                                                <div className="space-y-2">
+                                                    <div>
+                                                        <div className="flex justify-between text-[11px] mb-1" style={{ color: 'var(--cloud-text-secondary)' }}><span>CPU</span><span>{cp}%</span></div>
+                                                        <div className="cloud-meter"><div style={{ width: `${cp}%`, background: meterColor(cp) }} /></div>
+                                                    </div>
+                                                    <div>
+                                                        <div className="flex justify-between text-[11px] mb-1" style={{ color: 'var(--cloud-text-secondary)' }}><span>RAM</span><span>{mp}%</span></div>
+                                                        <div className="cloud-meter"><div style={{ width: `${mp}%`, background: meterColor(mp) }} /></div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry } = useAuth();
-            const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate layout
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
+            const { isCorporate, isCloud } = useLayout(); // LW: Feb 2026 - corporate layout / NS 2026-06: + cloud (Preview)
             const [clusters, setClusters] = useState([]);
             const [clusterGroups, setClusterGroups] = useState([]); // NS Jan 2026 - for grouping
             const [collapsedGroups, setCollapsedGroups] = useState({}); // Track which groups are collapsed
@@ -12638,6 +12765,33 @@
                 if (cId) fetchClusterResources(cId);
             };
 
+            // NS 2026-06: pulled out of the inline CreateSnapshotModal onSubmit so the Cloud
+            // skin can reuse the exact same create logic — the snapshot modal renders in both
+            // the classic return and the cloud branch and they share dashSnapshotVm state.
+            const handleDashSnapshotSubmit = async (snapname, description, vmstate, modeInfo) => {
+                const vm = dashSnapshotVm;
+                if (!vm) return;
+                const cId = vm._clusterId || selectedCluster?.id;
+                setDashSnapshotLoading(true);
+                try {
+                    const url = modeInfo?.mode === 'efficient'
+                        ? `${API_URL}/clusters/${cId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots`
+                        : `${API_URL}/clusters/${cId}/vms/${vm.node}/${vm.type}/${vm.vmid}/snapshots`;
+                    const body = modeInfo?.mode === 'efficient'
+                        ? { snapname, description, snap_size_gb: modeInfo.snap_size_gb }
+                        : { snapname, description, vmstate };
+                    const res = await authFetch(url, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+                    if (res && res.ok) {
+                        addToast(`${t('snapshotCreated') || 'Snapshot created'}: '${snapname}'`);
+                        setDashSnapshotVm(null);
+                    } else if (res) {
+                        const err = await res.json();
+                        addToast(err.error || 'Snapshot failed', 'error');
+                    }
+                } catch { addToast(t('connectionError'), 'error'); }
+                setDashSnapshotLoading(false);
+            };
+
             // LW: Mar 2026 - build menu items for sidebar right-click
             // NS: kept this in dashboard so it has direct access to all the handlers
             const buildContextMenuItems = (type, target) => {
@@ -12877,6 +13031,115 @@
 
                 return [];
             };
+
+            // NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own
+            // self-contained shell (cloud.js). Mount it instead of the Modern/Corporate
+            // chrome. onExitCloud flips back to Modern so the user is never locked in.
+            if (isCloud) {
+                // bundle the existing dashboard handlers/modal-openers so the Cloud shell
+                // wires the SAME real endpoints (cluster-id threading, confirms, optimistic
+                // UI, toasts all already live in these) rather than re-implementing fetch.
+                const cloudActions = {
+                    vmAction: handleVmAction,                         // (resource, action)
+                    forceStop: handleForceStop,                       // (resource)
+                    openConsole: handleOpenConsole,                   // (resource)
+                    openLxcShell: (vm) => setLxcShellVm(vm),
+                    openConfig: handleOpenConfig,                     // (resource) -> ConfigModal
+                    openMetrics: (vm) => setCorpMetricsVm(vm),
+                    migrate: (vm) => setDashMigrateVm(vm),
+                    clone: (vm) => setDashCloneVm(vm),
+                    del: (vm) => setDashDeleteVm(vm),
+                    crossMigrate: (vm) => setDashCrossClusterVm(vm),
+                    snapshot: (vm) => setDashSnapshotVm(vm),
+                    createVm: (type) => setShowCreateVm(type || 'qemu'),
+                    nodeAction: handleNodeAction,                     // (nodeName, 'reboot'|'shutdown')
+                    maintenanceToggle: handleMaintenanceToggle,       // (nodeName, enable)
+                    startUpdate: handleStartUpdate,                   // (nodeName, reboot)
+                    configNode: (node) => setConfigNode(node),
+                    openSettings: () => setShowSettings(true),
+                    openProfile: () => setShowProfile(true),
+                    refresh: () => {
+                        if (!selectedCluster) return;
+                        fetchClusterMetrics(selectedCluster.id);
+                        fetchClusterResources(selectedCluster.id);
+                        fetchClusterDatastores(selectedCluster.id);
+                        fetchClusterNetworks(selectedCluster.id);
+                        fetchClusterPools(selectedCluster.id);
+                        fetchTasks(selectedCluster.id);
+                    },
+                };
+                return (
+                    <div style={{ height: '100vh', overflow: 'hidden' }}>
+                        <CloudShell
+                            clusters={clusters}
+                            selectedCluster={selectedCluster}
+                            setSelectedCluster={setSelectedCluster}
+                            clusterResources={clusterResources}
+                            clusterMetrics={clusterMetrics}
+                            allClusterMetrics={allClusterMetrics}
+                            /* datastores: source from the always-set sidebar cache — the
+                               clusterDatastores state has a selectedClusterRef guard that
+                               races against the cloud auto-select and can stay empty. -- NS */
+                            clusterDatastores={(selectedCluster && sidebarClusterData[selectedCluster.id] && sidebarClusterData[selectedCluster.id].datastores) || clusterDatastores}
+                            clusterNetworks={clusterNetworks}
+                            clusterPools={clusterPools}
+                            tasks={tasks}
+                            knownNodes={knownNodes}
+                            actions={cloudActions}
+                            isAdmin={isAdmin}
+                            currentUser={user}
+                            t={t}
+                            onExitCloud={() => updatePreferences({ ui_layout: 'modern', theme: 'proxmoxDark' })}
+                            onOpenSettings={() => setShowSettings(true)}
+                            onOpenProfile={() => setShowProfile(true)}
+                            onLogout={logout}
+                        />
+                        {/* Resource-action modals — shared dashboard state, mounted here too so
+                            they surface over the cloud shell. The classic copies live in the main
+                            return; the skins are mutually exclusive so only one set ever mounts. */}
+                        {configVm && (configVm._clusterId || selectedCluster) && (
+                            <ConfigModal vm={configVm} clusterId={configVm._clusterId || selectedCluster.id} allClusters={clusters} dashboardAuthFetch={authFetch} onClose={handleCloseConfig} addToast={addToast} isCorporate={false} />
+                        )}
+                        {configNode && selectedCluster && (
+                            <NodeModal node={configNode} clusterId={selectedCluster.id} clusterType={selectedCluster.cluster_type || 'proxmox'} onClose={() => setConfigNode(null)} addToast={addToast} />
+                        )}
+                        {dashMigrateVm && (
+                            <MigrateModal vm={dashMigrateVm} nodes={Object.keys(clusterMetrics)} clusterId={dashMigrateVm._clusterId || selectedCluster?.id} onMigrate={handleMigrate} onClose={() => setDashMigrateVm(null)} />
+                        )}
+                        {dashCloneVm && (
+                            <CloneVmModal vm={dashCloneVm} nodes={Object.keys(clusterMetrics)} clusterId={dashCloneVm._clusterId || selectedCluster?.id} onClone={handleCloneVm} onClose={() => setDashCloneVm(null)} />
+                        )}
+                        {dashDeleteVm && (
+                            <DeleteVmModal vm={dashDeleteVm} clusterId={dashDeleteVm._clusterId || selectedCluster?.id} onDelete={handleDeleteVm} onClose={() => setDashDeleteVm(null)} />
+                        )}
+                        {dashCrossClusterVm && clusters.length > 1 && (
+                            <CrossClusterMigrateModal vm={dashCrossClusterVm} sourceCluster={selectedCluster} clusters={clusters} onMigrate={handleCrossClusterMigrate} onClose={() => setDashCrossClusterVm(null)} />
+                        )}
+                        {dashSnapshotVm && (
+                            <CreateSnapshotModal isQemu={dashSnapshotVm.type === 'qemu'} loading={dashSnapshotLoading} onSubmit={handleDashSnapshotSubmit} onClose={() => setDashSnapshotVm(null)} />
+                        )}
+                        {showCreateVm && selectedCluster && (
+                            <CreateVmModal vmType={showCreateVm} clusterId={selectedCluster.id} clusterType={selectedCluster.cluster_type || 'proxmox'} nodes={Object.keys(clusterMetrics)} onCreate={handleCreateVm} onClose={() => setShowCreateVm(null)} />
+                        )}
+                        {consoleStack.map(c => (
+                            c.info ? (
+                                <ConsoleModal key={c.id} vm={c.vm} consoleInfo={c.info} clusterId={c.vm._clusterId || selectedCluster?.id} onClose={() => handleCloseConsole(c.id)} hidden={c.id !== activeConsoleId} />
+                            ) : null
+                        ))}
+                        {lxcShellVm && (
+                            <LxcShellModal vm={lxcShellVm} clusterId={lxcShellVm._clusterId || selectedCluster?.id} addToast={addToast} onClose={() => setLxcShellVm(null)} />
+                        )}
+                        {corpMetricsVm && selectedCluster && (
+                            <VmMetricsModal vm={corpMetricsVm} clusterId={selectedCluster.id} onClose={() => setCorpMetricsVm(null)} />
+                        )}
+                        {/* full admin settings + per-user profile — the SAME standalone modals the
+                            classic layout uses, mounted here so the Cloud skin has full config parity
+                            (they self-gate on isOpen + pull all context from the app providers). */}
+                        <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
+                        <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
+                    </div>
+                );
+            }
 
             return (
                 <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`}>
@@ -14092,7 +14355,9 @@
 
                                         {/* Overview Tab */}
                                         {activeTab === 'overview' && (
-                                            isCorporate && selectedSidebarNode ? (
+                                            isCloud ? (
+                                                <CloudOverviewGrid clusters={clusters} selectedCluster={selectedCluster} clusterMetrics={clusterMetrics} clusterResources={clusterResources} t={t} />
+                                            ) : isCorporate && selectedSidebarNode ? (
                                             <CorporateNodeDetailView
                                                 node={selectedSidebarNode.name}
                                                 clusterId={selectedSidebarNode.clusterId}
@@ -21592,28 +21857,7 @@
                         <CreateSnapshotModal
                             isQemu={dashSnapshotVm.type === 'qemu'}
                             loading={dashSnapshotLoading}
-                            onSubmit={async (snapname, description, vmstate, modeInfo) => {
-                                const vm = dashSnapshotVm;
-                                const cId = vm._clusterId || selectedCluster?.id;
-                                setDashSnapshotLoading(true);
-                                try {
-                                    const url = modeInfo?.mode === 'efficient'
-                                        ? `${API_URL}/clusters/${cId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots`
-                                        : `${API_URL}/clusters/${cId}/vms/${vm.node}/${vm.type}/${vm.vmid}/snapshots`;
-                                    const body = modeInfo?.mode === 'efficient'
-                                        ? { snapname, description, snap_size_gb: modeInfo.snap_size_gb }
-                                        : { snapname, description, vmstate };
-                                    const res = await authFetch(url, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
-                                    if (res && res.ok) {
-                                        addToast(`${t('snapshotCreated') || 'Snapshot created'}: '${snapname}'`);
-                                        setDashSnapshotVm(null);
-                                    } else if (res) {
-                                        const err = await res.json();
-                                        addToast(err.error || 'Snapshot failed', 'error');
-                                    }
-                                } catch { addToast(t('connectionError'), 'error'); }
-                                setDashSnapshotLoading(false);
-                            }}
+                            onSubmit={handleDashSnapshotSubmit}
                             onClose={() => setDashSnapshotVm(null)}
                         />
                     )}

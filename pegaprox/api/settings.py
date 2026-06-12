@@ -81,7 +81,7 @@ def get_pegaprox_version():
 
 # NS: Military Grade Encryption Status & Migration - Jan 2026
 @bp.route('/api/pegaprox/security/status', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_security_status():
     """Get encryption and security status"""
     db = get_db()
@@ -164,7 +164,7 @@ def get_security_status():
 
 
 @bp.route('/api/pegaprox/security/migrate-all', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def migrate_all_encryption():
     """Force migration of all data to latest encryption
     
@@ -230,7 +230,7 @@ def migrate_all_encryption():
 
 
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def check_pegaprox_update():
     """Check for PegaProx updates (mirror + GitHub fallback).
 
@@ -342,7 +342,7 @@ def check_pegaprox_update():
 
 
 @bp.route('/api/pegaprox/update', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def perform_pegaprox_update():
     """PegaProx auto-update from GitHub
 
@@ -831,7 +831,7 @@ def perform_pegaprox_update():
         return jsonify({'error': safe_error(e, 'Update failed')}), 500
 
 @bp.route('/api/pegaprox/update/rollback', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['update.manage'])
 def rollback_pegaprox_update():
     """Rollback to a previous PegaProx version from backup
     
@@ -1037,6 +1037,65 @@ def serve_favicon():
     # return empty response if no favicon (prevents 404 spam in logs)
     return '', 204
 
+# MK 2026-06-11 (Nico) — sponsor logos must ALWAYS render. A freshly-added
+# sponsor asset doesn't always reach an existing install (the per-file updater
+# missed it — that's how Expertize's sponsor3.png went missing on some boxes).
+# So make them redundant: if a sponsors/* file is absent locally, pull it from
+# the update mirror, then GitHub. We try to cache it to images/sponsors/ so it
+# self-heals — but if that folder isn't writable (read-only mount, or the app
+# dir owned by root while we run as a restricted user, common on bare-metal) we
+# keep the bytes in memory and serve them directly, so wrong permissions can't
+# break the logo. Skipped in air-gap mode (no egress). Negative-cached so a
+# genuinely-absent file isn't re-fetched on every page load.
+_SPONSOR_HEAL_SOURCES = (
+    "https://updates.pegaprox.com/images/sponsors/{name}",
+    "https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/images/sponsors/{name}",
+)
+_sponsor_heal_misses = {}  # name -> monotonic ts of last failed remote fetch
+_sponsor_mem_cache = {}    # name -> (bytes, content_type) — fallback when images/ isn't writable
+
+def _get_healed_sponsor(filename):
+    """Return (content, content_type) for a missing sponsors/* asset pulled from
+    the mirror then GitHub. Caches to images/sponsors/ when writable, otherwise
+    keeps it in memory so the logo still shows on read-only installs. Returns
+    (None, None) in air-gap mode, on a recent miss, or if it can't be fetched."""
+    name = os.path.basename(filename)
+    if not re.match(r'^sponsor[\w-]+\.(png|svg|jpg|jpeg|webp|gif)$', name, re.I):
+        return None, None
+    if name in _sponsor_mem_cache:          # fetched before but couldn't write to disk
+        return _sponsor_mem_cache[name]
+    try:
+        if load_server_settings().get('air_gap_mode', False):
+            return None, None
+    except Exception:
+        pass
+    now = time.monotonic()
+    if now - _sponsor_heal_misses.get(name, 0) < 600:
+        return None, None
+    for tmpl in _SPONSOR_HEAL_SOURCES:
+        url = tmpl.format(name=name)
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+                ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
+                try:
+                    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
+                    os.makedirs(dst_dir, exist_ok=True)
+                    with open(os.path.join(dst_dir, name), 'wb') as fh:
+                        fh.write(r.content)
+                    logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
+                except Exception as werr:
+                    # images/ not writable — keep it in memory so the logo still
+                    # renders; perms must not be able to break a sponsor logo.
+                    _sponsor_mem_cache[name] = (r.content, ctype)
+                    logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
+                _sponsor_heal_misses.pop(name, None)
+                return r.content, ctype
+        except Exception as e:
+            logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
+    _sponsor_heal_misses[name] = now
+    return None, None
+
 @bp.route('/images/<path:filename>')
 def serve_images(filename):
     """Serve image files (pegaprox logo, sponsor logos, login background).
@@ -1051,6 +1110,15 @@ def serve_images(filename):
         branding_path = os.path.join(BRANDING_DIR, filename)
         if os.path.exists(branding_path):
             return send_from_directory(BRANDING_DIR, filename)
+    # sponsor logos are redundant — self-heal a missing one from mirror/GitHub
+    if filename.startswith('sponsors/') and not os.path.exists(os.path.join(IMAGES_DIR, filename)):
+        _content, _ctype = _get_healed_sponsor(filename)
+        # if the disk cache couldn't be written (read-only images/), serve the
+        # fetched bytes straight from memory so the logo still shows
+        if _content is not None and not os.path.exists(os.path.join(IMAGES_DIR, filename)):
+            resp = Response(_content, mimetype=_ctype)
+            resp.headers['Cache-Control'] = 'public, max-age=86400'
+            return resp
     return send_from_directory(IMAGES_DIR, filename)
 
 
@@ -1088,7 +1156,7 @@ def serve_sw():
     return resp
 
 @bp.route('/api/settings/server', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def get_server_settings():
     """Get server settings (admin only)"""
     settings = load_server_settings()
@@ -1138,7 +1206,7 @@ def get_password_policy():
     })
 
 @bp.route('/api/settings/server', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def update_server_settings():
     """Update server settings (admin only)
     
@@ -1699,7 +1767,7 @@ def update_server_settings():
         return jsonify({'error': safe_error(e, 'Settings update failed')}), 500
 
 @bp.route('/api/settings/login-background', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def delete_login_background():
     """Remove custom login background — clean both locations (config/branding +
     legacy images/) in case an old install still has the file in the
@@ -1714,7 +1782,7 @@ def delete_login_background():
     return jsonify({'success': True})
 
 @bp.route('/api/settings/server/restart', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def restart_server():
     """Restart the PegaProx server (admin only)"""
     try:
@@ -1767,7 +1835,7 @@ def restart_server():
 
 # MK: Mar 2026 - ACME / Let's Encrypt endpoints (#96)
 @bp.route('/api/settings/acme/status', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def get_acme_status():
     """Get ACME certificate status and settings"""
     try:
@@ -1806,7 +1874,7 @@ def get_acme_status():
 
 
 @bp.route('/api/settings/acme/request', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def request_acme_certificate():
     """Request a new ACME certificate — supports Let's Encrypt and custom CAs"""
     try:
@@ -1895,7 +1963,7 @@ def request_acme_certificate():
 
 
 @bp.route('/api/settings/acme/dns/complete', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.certificate'])
 def complete_acme_dns_challenge():
     """Complete a pending ACME DNS-01 certificate request."""
     try:
@@ -2655,7 +2723,7 @@ def check_ip_whitelist():
         }), 403
 
 @bp.route('/api/security/ip-whitelist', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_ip_whitelist():
     """Get IP whitelist configuration (admin only)"""
     try:
@@ -2676,7 +2744,7 @@ def get_ip_whitelist():
         return jsonify({'error': safe_error(e, 'IP whitelist load failed')}), 500
 
 @bp.route('/api/security/ip-whitelist', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def update_ip_whitelist():
     """Update IP whitelist configuration (admin only)
     
@@ -2752,7 +2820,7 @@ def update_ip_whitelist():
         return jsonify({'error': safe_error(e, 'IP whitelist update failed')}), 500
 
 @bp.route('/api/security/ip-whitelist/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def test_ip_whitelist():
     """Test if an IP would be allowed (admin only)
     
@@ -2780,7 +2848,7 @@ def test_ip_whitelist():
 # ============================================
 
 @bp.route('/api/audit', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.audit'])
 def get_audit_log_api():
     """Get audit log entries (admin only). ?format=csv streams CSV for compliance export."""
     # Optional filters
@@ -2921,7 +2989,7 @@ def get_cluster_audit_log_api(cluster_id):
 
 
 @bp.route('/api/audit/integrity', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.audit'])
 def verify_audit_integrity():
     """Verify integrity of audit log using HMAC signatures (admin only)
     
@@ -2942,14 +3010,14 @@ def verify_audit_integrity():
     return jsonify(result)
 
 @bp.route('/api/security/key-info', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_encryption_key_info():
     """get info about current encryption key (exists, created, algorithm, backups)"""
     database = get_db()
     return jsonify(database.get_key_info())
 
 @bp.route('/api/security/key-rotate', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def rotate_encryption_key():
     """Rotate the encryption key (admin only)
     
@@ -2983,7 +3051,7 @@ def rotate_encryption_key():
         return jsonify(result), 500
 
 @bp.route('/api/security/compliance', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_compliance_status():
     """Get security compliance status (admin only)
     
@@ -3052,7 +3120,7 @@ def get_compliance_status():
         return jsonify({'error': safe_error(e, 'Compliance check failed')}), 500
 
 @bp.route('/api/security/cors', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def get_cors_origins():
     """Get configured CORS origins (admin only)"""
     env_origins = [o.strip() for o in _cors_origins_env.split(',') if o.strip()] if _cors_origins_env else []
@@ -3071,7 +3139,7 @@ def get_cors_origins():
     })
 
 @bp.route('/api/security/cors', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['security.settings.manage'])
 def add_cors_origin():
     """Manually add a CORS origin (admin only)
 
@@ -3225,7 +3293,7 @@ def get_status():
 
 
 @bp.route('/api/support-bundle', methods=['GET'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def generate_support_bundle():
     """Generate a support bundle with logs and system info for troubleshooting
     
@@ -4357,7 +4425,7 @@ def start_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['DELETE'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def cancel_rolling_update(cluster_id):
     """Cancel a running rolling update"""
     if cluster_id not in cluster_managers:
@@ -4384,7 +4452,7 @@ def cancel_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/resume', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def resume_rolling_update(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -4400,7 +4468,7 @@ def resume_rolling_update(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/clear', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['node.update'])
 def clear_rolling_update_status(cluster_id):
     """Clear completed/cancelled rolling update status (dismiss notification)"""
     if cluster_id not in cluster_managers:
@@ -4838,7 +4906,7 @@ def get_timezones_api():
 # =====================================================
 
 @bp.route('/api/settings/ldap/test', methods=['POST'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['admin.settings'])
 def test_ldap():
     """Test LDAP connection and optionally test user authentication"""
     data = request.json or {}

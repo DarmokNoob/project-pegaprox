@@ -439,7 +439,7 @@ def get_datacenter_options(cluster_id):
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/options', methods=['PUT'])
-@require_auth(roles=[ROLE_ADMIN])
+@require_auth(perms=['cluster.config'])
 def set_datacenter_options(cluster_id):
     """Update datacenter options"""
     ok, err = check_cluster_access(cluster_id)
@@ -1013,7 +1013,16 @@ def upload_to_datastore(cluster_id, storage_name):
         else:
             # MK: Mar 2026 - safe error parsing, Proxmox sometimes returns HTML on 5xx
             try:
-                error_msg = response.json().get('errors', response.text)
+                pve = response.json()
+                errs = pve.get('errors')
+                # MK 2026-06-08 (#524 ccesario): PVE returns field errors as a dict
+                # (e.g. {'filename': 'invalid format - ...'} when a name carries chars
+                # it won't accept, like parentheses). Flatten it — handing the dict
+                # straight through showed up as "[object Object]" in the upload alert.
+                if isinstance(errs, dict):
+                    error_msg = '; '.join(f"{k}: {v}" for k, v in errs.items()) or pve.get('message') or 'Upload failed'
+                else:
+                    error_msg = errs or pve.get('message') or response.text or 'Upload failed'
             except Exception:
                 error_msg = response.text[:500] if response.text else 'Upload failed'
             logging.error(f"Upload to {storage_name} failed: HTTP {response.status_code} - {error_msg}")
@@ -6788,9 +6797,13 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     
     NS: Auth via query param since WebSocket can't send custom headers
     """
-    ok, err = check_cluster_access(cluster_id)
-    if not ok:
-        return err
+    # MK 2026-06-10: don't call check_cluster_access() here. This route has no
+    # @require_auth (it authenticates via the ?token=/?session= query param below,
+    # because a WebSocket can't send custom headers), so request.session isn't
+    # populated yet and check_cluster_access() would blow up with
+    # AttributeError: 'Request' object has no attribute 'session' on every GET.
+    # The cluster gate is enforced by _console_authz() below — it does the same
+    # get_user_clusters() + VM-ACL fallback against the resolved query-param user.
     # NS: Mar 2026 - prefer WS token, session as fallback
     from pegaprox.utils.realtime import validate_ws_token
     ws_token = request.args.get('token')
@@ -6817,9 +6830,8 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     users = load_users()
     user = users.get(auth_user, {})
     user_perms = get_user_permissions(user)
-    if 'vm.console' not in user_perms and auth_role != ROLE_ADMIN:
-        return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
-
+    # MK 2026-06-10 (#537/RBAC): coarse "global vm.console perm OR admin" pre-check dropped —
+    # the per-VM _console_authz gate below is authoritative and portal/custom-role aware.
     # H-1/H-2: cluster + per-VM gate (vm.console alone isn't enough)
     user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
@@ -6828,8 +6840,10 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
 
     # This route is just a fallback - actual WebSocket handling is done by the
     # dedicated WebSocket server started in start_vnc_websocket_server()
-    from flask import request
-    
+    # MK 2026-06-10: removed a redundant local `from flask import request` here —
+    # request is already module-level, and the local re-import made `request` a
+    # function-local, so the request.args.get(...) auth lookup above raised
+    # UnboundLocalError once check_cluster_access (which used to crash first) was gone.
     print(f"\n*** VNC ROUTE HIT (HTTP): {vm_type}/{vmid} on {node} ***")
     print(f"HTTP_UPGRADE: {request.environ.get('HTTP_UPGRADE', 'NONE')}")
     print(f"wsgi.websocket: {request.environ.get('wsgi.websocket', 'NONE')}")
@@ -6932,12 +6946,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # check perms from token
             users = load_users()
             user = users.get(token_data['user'], {})
-            user_perms = get_user_permissions(user)
-            if 'vm.console' not in user_perms and token_data['role'] != ROLE_ADMIN:
-                print(f"ERROR: User {token_data['user']} lacks vm.console permission")
-                await websocket.close(1002, "Permission denied")
-                return
             user['username'] = token_data['user']
+            # MK 2026-06-10 (#537 abyss1): the per-VM _console_authz gate below (H-1/H-2) is the
+            # authoritative check (cluster + per-VM vm.console via user_can_access_vm). The old
+            # coarse "global vm.console perm OR admin" pre-check here rejected Client-Portal users
+            # — they hold per-VM console access through the portal model, not a global RBAC perm —
+            # so the portal console hung at "Connecting…". Dropped; _console_authz still enforces it.
             print(f"User {token_data['user']} authenticated for VNC (ws_token)")
         elif session_id:
             session = validate_session(session_id)
@@ -6947,12 +6961,8 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 return
             users = load_users()
             user = users.get(session['user'], {})
-            user_perms = get_user_permissions(user)
-            if 'vm.console' not in user_perms and session['role'] != ROLE_ADMIN:
-                print(f"ERROR: User {session['user']} lacks vm.console permission")
-                await websocket.close(1002, "Permission denied")
-                return
             user['username'] = session['user']
+            # #537: per-VM _console_authz below is the authoritative gate (see ws_token note).
             print(f"User {session['user']} authenticated for VNC (session)")
         else:
             print("ERROR: No token or session provided")
@@ -7504,10 +7514,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         users = load_users()
         user = users.get(token_data['user'], {})
         user_perms = get_user_permissions(user)
-        if 'vm.console' not in user_perms and token_data['role'] != ROLE_ADMIN:
-            try: ws.send('Permission denied')
-            except: pass
-            return
+        # #537/RBAC: coarse "global vm.console OR admin" pre-check dropped — _console_authz below is authoritative.
         auth_user = token_data['user']
     elif session_id:
         session = validate_session(session_id)
@@ -7518,10 +7525,7 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         users = load_users()
         user = users.get(session['user'], {})
         user_perms = get_user_permissions(user)
-        if 'vm.console' not in user_perms and session['role'] != ROLE_ADMIN:
-            try: ws.send('Permission denied')
-            except: pass
-            return
+        # #537/RBAC: coarse pre-check dropped — _console_authz below is authoritative.
         auth_user = session['user']
     else:
         try: ws.send('Authentication required')
@@ -8412,7 +8416,7 @@ async def main():
     # crcro on issue #388 reported the exact SSH-WS InvalidUpgrade trace this fixes.
     _lpr_ssh = None
     try:
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+        sys.path.insert(0, os.environ.get('PEGAPROX_PKG_BASE') or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
         from pegaprox.utils.ws_lenient import lenient_process_request as _lpr_ssh
     except Exception as _e:
         print(f"[SSH-WS] WARNING: lenient_process_request not importable ({_e}) — strict handshake only")
@@ -8436,8 +8440,18 @@ if __name__ == '__main__':
     asyncio.run(main())
 '''
     
-    # Write the script to a file
+    # Write the helper script where the service user can actually write.
+    # MK 2026-06-09 (#528 akagoldsmith): the Debian package lives under
+    # /usr/lib/pegaprox (root-owned, read-only for the pegaprox service user), so
+    # writing into the package's api/ dir failed with EACCES and the SSH-WS
+    # subprocess never started — port 5002 stayed dead. Fall back to a writable dir;
+    # the subprocess gets the package base via PEGAPROX_PKG_BASE below so its
+    # `import pegaprox.*` still resolves from wherever the script ends up.
+    import tempfile
+    pkg_base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    if not os.access(script_dir, os.W_OK):
+        script_dir = tempfile.gettempdir()
     script_path = os.path.join(script_dir, '.ssh_ws_server.py')
     
     try:
@@ -8477,6 +8491,7 @@ if __name__ == '__main__':
         
         # Set environment variables for the subprocess
         env = os.environ.copy()
+        env['PEGAPROX_PKG_BASE'] = pkg_base  # #528: subprocess may live outside the pkg dir now
         env['SSH_WS_PORT'] = str(port)
         env['SSH_WS_HOST'] = host  # Issue #71: IPv6 support
         main_port = port - 2
@@ -8542,7 +8557,9 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
     users = load_users()
     user = users.get(session['user'], {})
     user_perms = get_user_permissions(user)
-    if 'node.shell' not in user_perms and session['role'] != ROLE_ADMIN:
+    # MK 2026-06-10 (RBAC): gate on the node.shell perm only — admin holds it via
+    # all-perms so the explicit admin bypass was redundant; a custom role with node.shell now works.
+    if 'node.shell' not in user_perms:
         logging.error(f"SHELL WS: User {session['user']} lacks node.shell permission")
         try:
             ws.send('{"status":"error","message":"Permission denied"}')

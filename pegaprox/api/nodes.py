@@ -14,6 +14,7 @@ from flask import Blueprint, jsonify, request
 from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
+from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117
 from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users, verify_password
@@ -1151,7 +1152,7 @@ def deploy_smbios_autoconfig(cluster_id, node):
         return jsonify({'success': True, 'message': f'SMBIOS Auto-Config deployed to {node}'})
 
     except Exception as e:
-        logging.error(f"Error deploying SMBIOS autoconfig to {node}: {e}")
+        logging.error(f"Error deploying SMBIOS autoconfig to {_sl(node)}: {e}")
         return jsonify({'error': safe_error(e, 'SMBIOS deploy failed')}), 500
     finally:
         if ssh:

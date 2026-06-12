@@ -462,6 +462,8 @@
             const { user } = useAuth();
             const layout = user?.ui_layout || 'modern';
             const isCorporate = layout === 'corporate';
+            // NS 2026-06-05 — Cloud skin (Preview). Third layout alongside modern/corporate.
+            const isCloud = layout === 'cloud';
 
             // Set data-layout on body whenever layout changes
             // also force matching theme so modern themes dont bleed into corporate
@@ -475,11 +477,16 @@
                     // body still had no data-corp-theme, leaving every component in dark.
                     document.body.dataset.corpTheme = isLight ? 'light' : '';
                     applyTheme(isLight ? 'corporateLight' : 'corporateDark');
+                } else if (isCloud) {
+                    // NS: force the cloud theme on layout change + F5-restore so the
+                    // teal/navy variables apply even if a stale theme was stored.
+                    delete document.body.dataset.corpTheme;
+                    applyTheme('cloud');
                 } else {
                     // leaving corporate -> clear so no stale attribute lingers
                     delete document.body.dataset.corpTheme;
                 }
             }, [layout]);
 
-            return { layout, isCorporate };
+            return { layout, isCorporate, isCloud };
         }

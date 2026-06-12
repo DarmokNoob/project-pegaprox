@@ -531,7 +531,9 @@ def _run_v2p_migration(task):
         
         # Network: match VMware (vmxnet3, E1000, E1000e)
         detected_nic = hw.get('nic_type_pve', 'e1000')
-        net_driver = task.net_driver if task.net_driver in ('e1000', 'e1000e', 'virtio', 'vmxnet3') else detected_nic
+        _valid_nic = ('e1000', 'e1000e', 'virtio', 'vmxnet3')
+        nic_explicit = task.net_driver in _valid_nic   # user picked a specific model, not 'auto'
+        net_driver = task.net_driver if nic_explicit else detected_nic
         
         # PVE requires DNS-valid names - ESXi allows spaces/special chars (#129)
         raw_name = vm_data.get('name', f'v2p-{task.proxmox_vmid}')
@@ -594,7 +596,14 @@ def _run_v2p_migration(task):
         preserve_mac = getattr(task, 'preserve_mac', False)
         if selected_nics:
             for idx, nic in enumerate(selected_nics if isinstance(selected_nics, list) else [selected_nics]):
-                model = nic.get('pve_model', net_driver) if isinstance(nic, dict) else net_driver
+                # MK 2026-06-09 (#536 narukeh): an explicit Network Model pick (e.g. VirtIO)
+                # must win on every NIC. pve_model is the source-detected per-NIC type
+                # (vmxnet3/e1000) — only let it stand in for the 'auto/match-source' case,
+                # otherwise the selected model was silently overridden by the ESXi type.
+                if nic_explicit:
+                    model = net_driver
+                else:
+                    model = nic.get('pve_model', net_driver) if isinstance(nic, dict) else net_driver
                 nic_str = f'{model},bridge={task.network_bridge}'
                 if preserve_mac and isinstance(nic, dict) and nic.get('mac_address'):
                     nic_str += f',macaddr={nic["mac_address"]}'
@@ -858,9 +867,12 @@ def _run_v2p_migration(task):
                 rc_a2, out_a2, _ = _pve_node_exec(pve_mgr, task.target_node,
                     f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id} 2>&1", timeout=30)
                 if rc_a2 != 0:
-                    err = str(out_a2 or '').strip()[:200]
-                    task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                    task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                    out_full = str(out_a2 or '').strip()
+                    # MK 2026-06-09 (#438 crcro): qm prints a "successfully created '<vol>'"
+                    # notice first, so [:200] showed that and cut the real error off the end.
+                    # Log the whole thing; surface the tail where qm puts the actual failure.
+                    task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_a2}): {out_full}")
+                    task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                     _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                     return
                 task.log(f"  Disk {i} attached as {disk_bus}{i}")
@@ -1061,9 +1073,11 @@ def _run_v2p_migration(task):
                 attach_cmd = f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id} 2>&1"
                 rc_a, out_a, _ = _pve_node_exec(pve_mgr, task.target_node, attach_cmd, timeout=30)
                 if rc_a != 0:
-                    err = str(out_a or '').strip()[:200]
-                    task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                    task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                    out_full = str(out_a or '').strip()
+                    # #438: log the full output, surface the tail — qm's "successfully
+                    # created" notice prints before the real error so a head-cut hid the cause.
+                    task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_a}): {out_full}")
+                    task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                     _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                     return
                 task.log(f"  Disk {i} attached as {disk_bus}{i}")
@@ -1201,9 +1215,11 @@ def _run_v2p_migration(task):
             else:
                 # NS May 2026 (#222): used to just warn — silent failure left the
                 # disk orphaned in storage so users had to `qm rescan` after.
-                err = str(out_at or '').strip()[:200]
-                task.log(f"  ✗ qm set --{disk_bus}{i} failed: {err}")
-                task.set_phase('failed', f'qm set --{disk_bus}{i} {vol_id} → {err}')
+                out_full = str(out_at or '').strip()
+                # #438: full output to the log + tail to the phase (qm's success notice
+                # prints before the real error, so a head-cut buried it).
+                task.log(f"  ✗ qm set --{disk_bus}{i} failed (rc={rc_at}): {out_full}")
+                task.set_phase('failed', f'qm set --{disk_bus}{i} → {out_full[-300:]}')
                 _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
                 return
 
@@ -2845,6 +2861,14 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
                 f"pvesm path {shlex.quote(vol_id)} 2>&1", timeout=10)
             dev_path = str(out_p or '').strip().split('\n')[0]
             if dev_path.startswith('/') and rc_p == 0:
+                # MK 2026-06-10 (#538 oetti77 / #272): `pvesm path` only computes the path
+                # string; for RBD (and other block storages) the kernel device isn't mapped
+                # until the volume is ACTIVATED. Without this, dd opened the resolved
+                # /dev/rbd-pve/<uuid>/... and got "No such file or directory". activate-volume
+                # krbd-maps RBD / activates the LV (no-op if already up). Best-effort — don't
+                # fail the alloc if activation errors (file storages don't need it).
+                _pve_node_exec(pve_mgr, node,
+                    f"pvesm activate-volume {shlex.quote(vol_id)} 2>/dev/null", timeout=30)
                 logging.info(f"[V2P] Disk allocated: {vol_id} → {dev_path} (via: {attempt_cmd[:60]})")
                 return vol_id, dev_path
 
@@ -3731,7 +3755,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     esxi_test_path = f"/vmfs/volumes/{datastore}/{vm_dir}/{flat0}"
     
     qemu_ssh_works = False
-    rc_qtest, out_qtest, _ = _pve_node_exec(pve_mgr, task.target_node,
+    rc_qtest, out_qtest, err_qtest = _pve_node_exec(pve_mgr, task.target_node,
         f"timeout 10 qemu-img info "
         f"'json:{{\"file.driver\":\"ssh\","
         f"\"file.host\":\"{esxi_host}\","
@@ -3740,19 +3764,19 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         f"\"file.user\":\"{esxi_user}\","
         f"\"file.host-key-check.mode\":\"none\","
         f"\"file.identity-file\":\"{key_path}\"}}' 2>&1",
-        timeout=20)
-    qtest_out = str(out_qtest or '')
+        timeout=20, ignore_node_backoff=True)
+    qtest_out = (str(out_qtest or '') + str(err_qtest or '')).strip()
     if rc_qtest == 0 and ('virtual size' in qtest_out or 'file format' in qtest_out):
         qemu_ssh_works = True
         task.log("QEMU SSH driver: connection OK")
     else:
         task.log(f"QEMU SSH driver test failed: {qtest_out[:200]}")
         # Try alternative: qemu-img with simpler SSH URL syntax
-        rc_qt2, out_qt2, _ = _pve_node_exec(pve_mgr, task.target_node,
+        rc_qt2, out_qt2, err_qt2 = _pve_node_exec(pve_mgr, task.target_node,
             f"timeout 10 qemu-img info "
             f"ssh://{esxi_user}@{esxi_host}{esxi_test_path} 2>&1",
-            timeout=20)
-        qt2_out = str(out_qt2 or '')
+            timeout=20, ignore_node_backoff=True)
+        qt2_out = (str(out_qt2 or '') + str(err_qt2 or '')).strip()
         if rc_qt2 == 0 and ('virtual size' in qt2_out or 'file format' in qt2_out):
             qemu_ssh_works = True
             task.log("QEMU SSH driver: connection OK (URL syntax)")
@@ -3786,12 +3810,12 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             f"?dcPath=ha-datacenter&dsName={ds_name}"
         )
         
-        rc_ht, out_ht, _ = _pve_node_exec(pve_mgr, task.target_node,
+        rc_ht, out_ht, err_ht = _pve_node_exec(pve_mgr, task.target_node,
             f"timeout 10 qemu-img info --force-share "
             f"'json:{{\"file.driver\":\"https\",\"file.url\":\"{test_url}\","
             f"\"file.sslverify\":\"off\"}}' 2>&1",
-            timeout=15)
-        ht_out = str(out_ht or '')
+            timeout=15, ignore_node_backoff=True)
+        ht_out = (str(out_ht or '') + str(err_ht or '')).strip()
         
         if rc_ht == 0 and ('virtual size' in ht_out or 'file format' in ht_out):
             task.log("QEMU HTTPS driver: connection OK ✓")
@@ -3859,16 +3883,25 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             flat_file = desc_file.replace('.vmdk', '-flat.vmdk')
             local_fuse_path = f"{mnt_path}/{vm_dir}/{flat_file}"
             
-            rc_chk, out_chk, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"test -f '{local_fuse_path}' && stat --format='%s' '{local_fuse_path}' 2>&1",
-                timeout=10)
-            chk_out = str(out_chk or '').strip()
+            rc_chk, out_chk, err_chk = _pve_node_exec(pve_mgr, task.target_node,
+                f"for i in 1 2 3 4 5 6 7 8 9 10; do "
+                f"test -f '{local_fuse_path}' && stat --format='%s' '{local_fuse_path}' && exit 0; "
+                f"sleep 1; "
+                f"done; "
+                f"echo NOTFOUND; "
+                f"echo '--- mount ---'; mount | grep '{mnt_path}' 2>&1 || true; "
+                f"echo '--- mnt_path ---'; ls -la '{mnt_path}' 2>&1 || true; "
+                f"echo '--- vm_dir ---'; ls -la '{mnt_path}/{vm_dir}' 2>&1 || true; "
+                f"echo '--- target_file ---'; ls -lh '{local_fuse_path}' 2>&1 || true; "
+                f"exit 1",
+                timeout=20, ignore_node_backoff=True)
+            chk_out = (str(out_chk or '') + str(err_chk or '')).strip()
             
             if rc_chk == 0 and chk_out.isdigit() and int(chk_out) > 0:
                 sshfs_flat_paths.append(local_fuse_path)
                 task.log(f"  SSHFS disk {di}: {local_fuse_path} ({int(chk_out) / (1024**3):.1f} GB)")
             else:
-                task.log(f"  SSHFS disk {di}: NOT accessible at {local_fuse_path}")
+                task.log(f"  SSHFS disk {di}: NOT accessible at {local_fuse_path}; debug: {chk_out[:1500]}")
                 sshfs_ok = False
                 break
         
@@ -3901,14 +3934,15 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             # No boot: line needed -- args: -device bootindex=0 controls boot order
             
             # Test: can QEMU open the SSHFS file?
-            rc_ftest, out_ftest, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"timeout 10 qemu-img info '{sshfs_flat_paths[0]}' 2>&1", timeout=15)
-            ftest_out = str(out_ftest or '')
+            rc_ftest, out_ftest, err_ftest = _pve_node_exec(pve_mgr, task.target_node,
+                f"timeout 30 qemu-img info -f raw '{sshfs_flat_paths[0]}' 2>&1",
+                timeout=40, ignore_node_backoff=True)
+            ftest_out = (str(out_ftest or '') + str(err_ftest or '')).strip()
             if 'virtual size' in ftest_out or 'file format' in ftest_out:
                 sshfs_boot = True
                 task.log("SSHFS QEMU test: OK")
             else:
-                task.log(f"SSHFS QEMU test failed: {ftest_out[:150]}")
+                task.log(f"SSHFS QEMU test failed: {ftest_out[:1000]}")
     
     # ----------------------------------------------------------------
     # Fallback 2: NBD bridge (most robust -- bypasses AppArmor & FUSE)
@@ -3921,13 +3955,15 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         task.log("SSHFS direct failed - trying NBD bridge...")
         
         # Check qemu-nbd is available
-        rc_nbd, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-            "which qemu-nbd 2>/dev/null", timeout=5)
+        rc_nbd, out_nbd, err_nbd = _pve_node_exec(pve_mgr, task.target_node,
+            "command -v qemu-nbd 2>/dev/null", timeout=5,
+            ignore_node_backoff=True)
         
         if rc_nbd == 0:
             # Load nbd kernel module
             _pve_node_exec(pve_mgr, task.target_node,
-                "modprobe nbd max_part=0 2>/dev/null", timeout=5)
+                "modprobe nbd max_part=0 2>/dev/null", timeout=5,
+                ignore_node_backoff=True)
             
             nbd_ok = True
             nbd_args_parts = []
@@ -3938,17 +3974,19 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 
                 # Kill any leftover nbd on this socket
                 _pve_node_exec(pve_mgr, task.target_node,
-                    f"fuser -k {sock_path} 2>/dev/null; rm -f {sock_path}", timeout=5)
+                    f"fuser -k {sock_path} 2>/dev/null; rm -f {sock_path}", timeout=5,
+                    ignore_node_backoff=True)
                 
                 # Start qemu-nbd serving the flat VMDK via Unix socket
-                rc_ns, out_ns, _ = _pve_node_exec(pve_mgr, task.target_node,
+                rc_ns, out_ns, err_ns = _pve_node_exec(pve_mgr, task.target_node,
                     f"qemu-nbd --fork --persistent "
                     f"--socket={sock_path} "
                     f"--format=raw "
                     f"--cache=writeback "
                     f"--aio=threads "
-                    f"'{fuse_path}' 2>&1", timeout=15)
-                ns_out = str(out_ns or '')
+                    f"'{fuse_path}' 2>&1", timeout=15,
+                    ignore_node_backoff=True)
+                ns_out = (str(out_ns or '') + str(err_ns or '')).strip()
                 
                 if rc_ns != 0:
                     task.log(f"  NBD disk {di}: qemu-nbd failed: {ns_out[:150]}")
@@ -3957,10 +3995,12 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 
                 # Verify socket exists
                 time.sleep(1)
-                rc_sc, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                    f"test -S {sock_path}", timeout=5)
+                rc_sc, out_sc, err_sc = _pve_node_exec(pve_mgr, task.target_node,
+                    f"test -S {sock_path}", timeout=5,
+                    ignore_node_backoff=True)
                 if rc_sc != 0:
-                    task.log(f"  NBD disk {di}: socket not created at {sock_path}")
+                    sc_out = (str(out_sc or '') + str(err_sc or '')).strip()
+                    task.log(f"  NBD disk {di}: socket not created at {sock_path}: {sc_out[:150]}")
                     nbd_ok = False
                     break
                 
@@ -3994,7 +4034,8 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                 nbd_boot = True
                 task.log("NBD bridge ready - QEMU will connect via Unix sockets")
         else:
-            task.log("qemu-nbd not available")
+            nbd_out = (str(out_nbd or '') + str(err_nbd or '')).strip()
+            task.log(f"qemu-nbd not available: {nbd_out[:150]}")
     elif not qemu_ssh_works and not sshfs_boot and not sshfs_flat_paths:
         # SSHFS mount failed entirely -- try remounting
         task.log("SSHFS not available - trying to remount...")
@@ -5687,9 +5728,14 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
             dl_out = str(out_dl or '').strip()
             task.log(f"  HTTPS: {dl_out[-250:]}")
 
-            bytes_m = re.search(r'(\d+) bytes', dl_out)
-            if bytes_m:
-                downloaded = int(bytes_m.group(1))
+            # MK 2026-06-11 (#538 oetti77): dd can print several "N bytes copied"
+            # lines (SIGUSR1 progress / final summary), so take the LAST match —
+            # re.search() grabbed the FIRST progress block and undercounted a
+            # finished transfer, which tripped a false "incomplete" and made the
+            # cleanup delete a fully-written volume.
+            _bytes_all = re.findall(r'(\d+) bytes', dl_out)
+            if _bytes_all:
+                downloaded = int(_bytes_all[-1])
             if downloaded >= flat_size * 0.9:
                 dl_success = True
                 task.log(f"  HTTPS OK: {downloaded/(1024**3):.2f} GB")
@@ -5734,9 +5780,9 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
             ssh_out = str(out_s or '').strip()
             task.log(f"  SSH: {ssh_out[-250:]}")
 
-            bytes_m2 = re.search(r'(\d+) bytes', ssh_out)
-            if bytes_m2:
-                downloaded = int(bytes_m2.group(1))
+            _bytes_all2 = re.findall(r'(\d+) bytes', ssh_out)  # #538: last line, not first
+            if _bytes_all2:
+                downloaded = int(_bytes_all2[-1])
             if downloaded >= flat_size * 0.9:
                 dl_success = True
                 task.log(f"  SSH OK: {downloaded/(1024**3):.2f} GB")
@@ -5764,8 +5810,8 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
                     f"cat {dd_log3}; rm -f {dd_log3}", timeout=86400)
                 dd_out = str(out_dd or '').strip()
                 task.log(f"  SSHFS: {dd_out[-200:]}")
-                bytes_m3 = re.search(r'(\d+) bytes', dd_out)
-                downloaded = int(bytes_m3.group(1)) if bytes_m3 else 0
+                _bytes_all3 = re.findall(r'(\d+) bytes', dd_out)  # #538: last, not first
+                downloaded = int(_bytes_all3[-1]) if _bytes_all3 else 0
                 if downloaded >= flat_size * 0.9:
                     dl_success = True
                 else:

@@ -2317,6 +2317,21 @@ def storage_preflight(cluster_id):
     password = data.get('password') or ''
     given_fp = (data.get('fingerprint') or '').strip().upper().replace(' ', '')
 
+    # SSRF guard (MK 2026-06-09, static-audit): the auth probe below POSTs the supplied
+    # username/password to server:port — same outbound check probe_pbs_fingerprint uses,
+    # so a tricked admin can't aim the credential POST at an arbitrary/metadata host.
+    if not server:
+        return jsonify({'ok': False, 'issues': ['server required'], 'info': {}}), 200
+    try:
+        from pegaprox.utils.url_security import is_safe_outbound_url
+        _ok, _reason = is_safe_outbound_url(f'https://{server}:{port}/',
+                                            allowed_schemes=('https',),
+                                            allow_private=True)  # PBS is usually on the LAN
+        if not _ok:
+            return jsonify({'ok': False, 'issues': [f'unsafe target: {_reason}'], 'info': {}}), 200
+    except Exception:
+        pass
+
     issues = []
     info = {}
 

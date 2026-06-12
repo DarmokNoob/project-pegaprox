@@ -62,6 +62,7 @@ SRC_FILES=(
     create_modals.js
     settings_modal.js
     worldmap.js
+    cloud.js
     dashboard.js
 )
 

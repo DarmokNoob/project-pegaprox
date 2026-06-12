@@ -2867,7 +2867,7 @@
                                         <p className="text-xs text-gray-400 mb-3">
                                             {t('layoutStyleDesc') || 'Choose between modern dashboard or corporate enterprise style.'}
                                         </p>
-                                        <div className="grid grid-cols-2 gap-3">
+                                        <div className="grid grid-cols-3 gap-3">
                                             {/* Modern layout card */}
                                             <button
                                                 onClick={async () => {
@@ -2939,6 +2939,39 @@
                                                 <div className="text-center">
                                                     <span className="text-xs font-medium">{t('layoutCorporate') || 'Corporate'}</span>
                                                     <p className="text-[10px] text-gray-500 mt-0.5">{t('layoutCorporateDesc') || 'Enterprise style, dense'}</p>
+                                                </div>
+                                            </button>
+                                            {/* Cloud layout card (Preview) — NS 2026-06-05 */}
+                                            <button
+                                                onClick={async () => {
+                                                    const result = await updatePreferences({ ui_layout: 'cloud', theme: 'cloud' });
+                                                    if (result.success) addToast(`${t('layoutStyle')}: Cloud`, 'success');
+                                                }}
+                                                className={`p-3 rounded-xl border-2 transition-all hover:scale-105 text-left ${
+                                                    user?.ui_layout === 'cloud'
+                                                        ? 'border-proxmox-orange ring-2 ring-proxmox-orange/30'
+                                                        : 'border-proxmox-border hover:border-gray-500'
+                                                }`}
+                                            >
+                                                <div className="h-16 rounded-lg mb-2 relative overflow-hidden border" style={{ background: '#0a1628', borderColor: '#1e3a52' }}>
+                                                    {/* Cloud preview: airy card grid, teal accent */}
+                                                    <div className="absolute inset-1.5 grid grid-cols-2 gap-1">
+                                                        <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                                        <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                                        <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                                        <div className="rounded flex items-center justify-center" style={{ background: '#16304a', border: '1px solid #22d3ee' }}>
+                                                            <div className="w-3 h-0.5 rounded-full" style={{ background: '#22d3ee' }} />
+                                                        </div>
+                                                    </div>
+                                                    {user?.ui_layout === 'cloud' && (
+                                                        <div className="absolute top-1 right-1 bg-proxmox-orange rounded-full p-0.5">
+                                                            <Icons.Check className="w-3 h-3 text-white" />
+                                                        </div>
+                                                    )}
+                                                </div>
+                                                <div className="text-center">
+                                                    <span className="text-xs font-medium inline-flex items-center justify-center gap-1">☁️ Cloud <span className="text-[8px] px-1 rounded" style={{ background: 'rgba(34,211,238,0.15)', color: '#22d3ee' }}>PREVIEW</span></span>
+                                                    <p className="text-[10px] text-gray-500 mt-0.5">{t('layoutCloudDesc') || 'Airy card grid, teal'}</p>
                                                 </div>
                                             </button>
                                         </div>
