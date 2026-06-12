@@ -25,6 +25,7 @@ from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.api.helpers import load_server_settings, get_connected_manager, check_cluster_access, safe_error
+from pegaprox.utils.node_hardening import deploy_pairing_hardening
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -198,6 +199,20 @@ def add_cluster():
     # NS: let frontend know if we auto-created an API token (#110)
     if getattr(manager, '_token_auto_created', False):
         result['api_token_created'] = True
+
+    # Pairing-time security hardening (Proxmox only — XCP-ng has its own SSH model)
+    if cluster_type == 'proxmox':
+        hardening = deploy_pairing_hardening(manager)
+        result['hardening'] = hardening
+        # If a new SSH key was generated, persist it now that we have the key material.
+        if hardening.get('ssh_key'):
+            save_config()
+        log_audit(
+            request.session['user'], 'cluster.hardening_applied',
+            f"Pairing hardening for {data.get('name')}: "
+            f"success={hardening['success']}, nodes={list(hardening['nodes'].keys())}",
+        )
+
     return jsonify(result), 201
 
 
